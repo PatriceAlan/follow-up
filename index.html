@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Suivi des candidatures</title>
+<style>
+  :root {
+    --bg: #faf8f4; --surface: #ffffff; --text: #22201c; --muted: #6b665d;
+    --line: #e4dfd5; --accent: #7a4b2a; --error: #a32020;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1b19; --surface: #262421; --text: #ece8e1; --muted: #a39d92;
+      --line: #3a3732; --accent: #d9a273; --error: #ef7b7b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 17px/1.5 Georgia, "Times New Roman", serif;
+  }
+  main { max-width: 60rem; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.2rem; margin: 1.5rem 0 .5rem; }
+  a { color: var(--accent); }
+  .muted { color: var(--muted); font-size: .9rem; }
+  .error { color: var(--error); }
+  form { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: 1rem; }
+  input, select, button {
+    font: inherit; padding: .5rem .75rem; border: 1px solid var(--line);
+    border-radius: .4rem; background: var(--surface); color: var(--text);
+  }
+  input[type="password"], input[type="search"] { flex: 1 1 14rem; }
+  button { background: var(--accent); color: var(--bg); border-color: var(--accent); cursor: pointer; }
+  ul.list { list-style: none; padding: 0; margin: 1rem 0 0; }
+  ul.list li { border-bottom: 1px solid var(--line); }
+  ul.list a { display: block; padding: .75rem .25rem; text-decoration: none; color: inherit; }
+  ul.list strong { display: block; }
+  .status {
+    display: inline-block; font-size: .85rem; padding: 0 .5rem; border-radius: 1rem;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  .text { white-space: pre-wrap; background: var(--surface); border: 1px solid var(--line);
+          border-radius: .4rem; padding: .75rem; overflow-wrap: anywhere; }
+  ol.history { padding-left: 1.25rem; }
+  [hidden] { display: none !important; }
+  @media (max-width: 30rem) {
+    dl { grid-template-columns: 1fr; }
+    dt { margin-top: .5rem; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Suivi des candidatures</h1>
+  <p class="muted" id="generated">Copie en lecture seule.</p>
+
+  <section id="login">
+    <form id="login-form">
+      <label for="password" hidden>Mot de passe</label>
+      <input id="password" type="password" autocomplete="current-password"
+             placeholder="Mot de passe" required>
+      <button type="submit">Ouvrir</button>
+    </form>
+    <p class="error" id="login-error" role="alert" hidden></p>
+  </section>
+
+  <section id="list" hidden>
+    <form id="filters" role="search">
+      <input id="search" type="search" placeholder="Entreprise ou poste" aria-label="Rechercher">
+      <select id="status" aria-label="Statut">
+        <option value="">En cours</option>
+        <option value="*">Toutes</option>
+      </select>
+    </form>
+    <p class="muted" id="count"></p>
+    <ul class="list" id="applications"></ul>
+  </section>
+
+  <section id="detail" hidden></section>
+</main>
+<script>
+  "use strict";
+  const CLOSED = ["rejected", "archived"];
+  let snapshot = null;
+
+  const bytes = (text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+
+  async function decrypt(payload, password) {
+    const material = await crypto.subtle.importKey(
+      "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt: bytes(payload.salt), iterations: payload.iterations, hash: "SHA-256" },
+      material, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+    const plain = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: bytes(payload.iv) }, key, bytes(payload.data));
+    return JSON.parse(new TextDecoder().decode(plain));
+  }
+
+  function day(iso) {
+    if (!iso) return "";
+    const [y, m, d] = iso.slice(0, 10).split("-");
+    return `${d}/${m}/${y}`;
+  }
+
+  function el(tag, text, className) {
+    const node = document.createElement(tag);
+    if (text != null) node.textContent = text;
+    if (className) node.className = className;
+    return node;
+  }
+
+  function fields(rows) {
+    const dl = el("dl");
+    for (const [label, value] of rows) {
+      if (value == null || value === "") continue;
+      dl.append(el("dt", label));
+      const dd = el("dd");
+      if (value instanceof Node) dd.append(value); else dd.textContent = value;
+      dl.append(dd);
+    }
+    return dl;
+  }
+
+  function link(url) {
+    // Only web links: a captured "javascript:" address is shown as text.
+    if (!/^https?:\/\//i.test(url)) return url;
+    const a = el("a", url);
+    a.href = url;
+    a.rel = "noopener noreferrer";
+    a.target = "_blank";
+    return a;
+  }
+
+  function renderList() {
+    const wanted = document.getElementById("search").value.trim().toLowerCase();
+    const status = document.getElementById("status").value;
+    const shown = snapshot.applications.filter((a) =>
+      (status === "*" || !CLOSED.includes(a.status)) &&
+      (!wanted || `${a.company} ${a.role}`.toLowerCase().includes(wanted)));
+    const list = document.getElementById("applications");
+    list.replaceChildren(...shown.map((a) => {
+      const item = el("li");
+      const anchor = el("a");
+      anchor.href = `#${a.id}`;
+      anchor.append(el("strong", `${a.company} — ${a.role}`));
+      const line = el("span", null, "muted");
+      line.append(el("span", a.status_label, "status"));
+      if (a.applied_on) line.append(` envoyée le ${day(a.applied_on)}`);
+      if (a.deadline_on) line.append(` · échéance ${day(a.deadline_on)}`);
+      anchor.append(line);
+      item.append(anchor);
+      return item;
+    }));
+    document.getElementById("count").textContent =
+      `${shown.length} candidature${shown.length > 1 ? "s" : ""}`;
+  }
+
+  function renderDetail(application) {
+    const detail = document.getElementById("detail");
+    const back = el("a", "← Toutes les candidatures");
+    back.href = "#";
+    const parts = [back, el("h2", `${application.company} — ${application.role}`)];
+    parts.push(fields([
+      ["Statut", application.status_label],
+      ["Envoyée le", day(application.applied_on)],
+      ["Échéance", day(application.deadline_on)],
+      ["Contrat", application.contract_type],
+      ["Lieu", application.location],
+      ["CV utilisé", application.base_cv],
+      ["Plateforme", application.platform],
+      ["Origine", application.source_label],
+      ["Lien", application.url ? link(application.url) : null],
+    ]));
+    if (application.notes) {
+      parts.push(el("h2", "Notes"), el("div", application.notes, "text"));
+    }
+    if (application.history.length) {
+      const list = el("ol", null, "history");
+      for (const entry of application.history) {
+        const when = day(entry.on) + (entry.at ? ` à ${entry.at}` : "");
+        list.append(el("li", `${when} — ${entry.label}${entry.detail ? ` : ${entry.detail}` : ""}`));
+      }
+      parts.push(el("h2", "Historique"), list);
+    }
+    const offer = application.offer;
+    if (offer) {
+      parts.push(el("h2", "Offre"), fields([
+        ["Intitulé", offer.title],
+        ["Entreprise", offer.company],
+        ["Lieu", offer.location],
+        ["Contrat", offer.contract_type],
+        ["Lien", offer.url ? link(offer.url) : null],
+      ]), el("div", offer.text, "text"));
+    }
+    detail.replaceChildren(...parts);
+  }
+
+  function route() {
+    if (!snapshot) return;
+    const id = Number(location.hash.slice(1));
+    const application = snapshot.applications.find((a) => a.id === id);
+    document.getElementById("list").hidden = Boolean(application);
+    document.getElementById("detail").hidden = !application;
+    if (application) {
+      renderDetail(application);
+      window.scrollTo(0, 0);
+    } else {
+      renderList();
+    }
+  }
+
+  document.getElementById("login-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const error = document.getElementById("login-error");
+    error.hidden = true;
+    try {
+      const response = await fetch("data.json", { cache: "no-store" });
+      if (!response.ok) throw new Error("unavailable");
+      const payload = await response.json();
+      try {
+        snapshot = await decrypt(payload, document.getElementById("password").value);
+      } catch {
+        error.textContent = "Mot de passe incorrect.";
+        error.hidden = false;
+        return;
+      }
+    } catch {
+      error.textContent = "Copie introuvable : réessayez dans quelques minutes.";
+      error.hidden = false;
+      return;
+    }
+    document.getElementById("login").hidden = true;
+    const generated = new Date(snapshot.generated_at);
+    document.getElementById("generated").textContent =
+      `Copie en lecture seule du ${generated.toLocaleDateString("fr-FR")} à ` +
+      generated.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) + ".";
+    route();
+  });
+  document.getElementById("filters").addEventListener("input", renderList);
+  document.getElementById("filters").addEventListener("submit", (event) => event.preventDefault());
+  window.addEventListener("hashchange", route);
+</script>
+</body>
+</html>
